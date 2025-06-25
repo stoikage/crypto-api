@@ -4,14 +4,16 @@ import numpy as np
 
 app = FastAPI()
 
+
 @app.get("/")
 def health():
     return {"status": "alive"}
 
+
 @app.get("/price/{symbol}")
 async def get_price(symbol: str):
     """
-    Get the latest spot price for a symbol (e.g., BTCUSDT)
+    Get latest Binance spot price
     """
     url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol.upper()}"
     async with httpx.AsyncClient() as client:
@@ -24,13 +26,13 @@ async def get_price(symbol: str):
             "price": float(data["price"])
         }
 
+
 @app.get("/funding/{symbol}")
 async def get_funding(symbol: str):
     """
-    Get latest funding rate, mark price, and next funding time from Binance Futures
+    Get latest funding rate, mark price, and next funding time from Binance Perps
     """
-    symbol = symbol.upper()
-    url = f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={symbol}"
+    url = f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={symbol.upper()}"
     async with httpx.AsyncClient() as client:
         resp = await client.get(url)
         if resp.status_code != 200:
@@ -43,32 +45,108 @@ async def get_funding(symbol: str):
             "nextFundingTime": int(data["nextFundingTime"])
         }
 
+
 @app.get("/rv/{symbol}")
 async def get_realized_vol(symbol: str):
     """
-    Calculate annualized 30-day realized volatility from daily closing prices.
+    Get 30-day annualized realized volatility from Binance spot
     """
-    symbol = symbol.upper()
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1d&limit=31"
-
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol.upper()}&interval=1d&limit=31"
     async with httpx.AsyncClient() as client:
         resp = await client.get(url)
         if resp.status_code != 200:
             return {"error": "Failed to fetch historical prices", "code": resp.status_code}
         data = resp.json()
 
-    # Extract closing prices
-    closes = [float(entry[4]) for entry in data]  # entry[4] = close
+    closes = [float(entry[4]) for entry in data]  # entry[4] = close price
     if len(closes) < 31:
         return {"error": "Insufficient data"}
 
-    # Compute log daily returns
     returns = np.diff(np.log(closes))
-
-    # Realized volatility = std dev of daily returns × sqrt(365)
     vol = np.std(returns) * np.sqrt(365)
+    return {
+        "symbol": symbol.upper(),
+        "realized_vol": round(vol * 100, 2)  # percent
+    }
+
+
+def compute_clearing_price(order_book: list[list[float]], quantity: float) -> dict:
+    """
+    Generic VWAP calculation over any standardized order book
+    """
+    filled = 0
+    total_cost = 0
+
+    for price, size in order_book:
+        take = min(quantity - filled, size)
+        total_cost += take * price
+        filled += take
+        if filled >= quantity:
+            break
+
+    if filled == 0:
+        return {"error": "No liquidity at any price", "filled": 0}
+
+    avg_price = total_cost / filled
+
+    if filled < quantity:
+        return {
+            "error": "Insufficient liquidity",
+            "filled": filled,
+            "requested": quantity,
+            "avg_price": round(avg_price, 6),
+            "total_cost": round(total_cost, 2)
+        }
 
     return {
-        "symbol": symbol,
-        "realized_vol": round(vol * 100, 2)  # return as %
+        "filled": filled,
+        "avg_price": round(avg_price, 6),
+        "total_cost": round(total_cost, 2)
+    }
+
+
+@app.get("/clearing/spot/{symbol}")
+async def clearing_spot(symbol: str, quantity: float):
+    """
+    Compute bid/ask VWAP clearing price using Binance Spot depth
+    """
+    url = f"https://api.binance.com/api/v3/depth?symbol={symbol.upper()}&limit=1000"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url)
+        if resp.status_code != 200:
+            return {"error": "Failed to fetch spot order book"}
+        data = resp.json()
+
+    bids = [[float(p), float(q)] for p, q in data["bids"]]
+    asks = [[float(p), float(q)] for p, q in data["asks"]]
+
+    return {
+        "symbol": symbol.upper(),
+        "venue": "spot",
+        "quantity": quantity,
+        "bid": compute_clearing_price(bids, quantity),
+        "ask": compute_clearing_price(asks, quantity)
+    }
+
+@app.get("/clearing/perp/{symbol}")
+async def clearing_perp(symbol: str, quantity: float):
+    """
+    Compute bid/ask VWAP clearing price using Binance Perps depth
+    """
+    url = f"https://fapi.binance.com/fapi/v1/depth?symbol={symbol.upper()}&limit=1000"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url)
+        if resp.status_code != 200:
+            return {"error": "Failed to fetch perp order book"}
+        data = resp.json()
+
+    bids = [[float(p), float(q)] for p, q in data["bids"]]
+    asks = [[float(p), float(q)] for p, q in data["asks"]]
+
+    return {
+        "symbol": symbol.upper(),
+        "venue": "perp",
+        "quantity": quantity,
+        "bid": compute_clearing_price(bids, quantity),
+        "ask": compute_clearing_price(asks, quantity)
     }
