@@ -1,16 +1,16 @@
 """
-binance-fastapi + RFQ Telegram bot (persistent)
+binance-fastapi + RFQ Telegram bot (persistent, PTB v22)
 
-ENV VARS (Render → Settings → Environment)
-------------------------------------------
+Required ENV VARS
+-----------------
 TELEGRAM_TOKEN      BotFather token
 WEBHOOK_SECRET      random string (same in setWebhook & header check)
 ADMIN_CHAT_ID       numeric ID of the traders group
 ALLOWED_SYMBOLS     comma list, e.g. "BTC,ETH,SOL"
-RFQ_TTL             seconds before an un-quoted RFQ expires   (default 120)
-MAX_VALIDITY        max seconds a quote can be valid          (default 120)
+RFQ_TTL             seconds before un-quoted RFQ expires   (default 120)
+MAX_VALIDITY        max seconds a quote can be valid       (default 120)
 DB_PATH             optional, default "/db/rfq.sqlite"
-PUBLIC_BASE_URL     optional override for public URL (useful locally)
+PUBLIC_BASE_URL     optional override for public URL
 """
 
 import asyncio, json, logging, os
@@ -21,17 +21,17 @@ from typing import Optional
 import httpx
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request, Response
-from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
+    Defaults,
 )
 from sqlmodel import SQLModel, Field, Session, create_engine
 
-# ─────────────────── CONFIG ──────────────────────────────────────────────
+# ───── CONFIG ────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN       = os.environ["TELEGRAM_TOKEN"]
@@ -44,31 +44,27 @@ ALLOWED_SYMBOLS = {
 RFQ_TTL      = int(os.getenv("RFQ_TTL", "120"))
 MAX_VALIDITY = int(os.getenv("MAX_VALIDITY", "120"))
 
-# Public URL discovery for setWebhook
 PUBLIC_BASE_URL = (
-    os.getenv("PUBLIC_BASE_URL")            # optional override
-    or os.getenv("RENDER_EXTERNAL_URL")     # Render always sets this
+    os.getenv("PUBLIC_BASE_URL")
+    or os.getenv("RENDER_EXTERNAL_URL")
+    or (
+        f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}"
+        if os.getenv("RENDER_EXTERNAL_HOSTNAME")
+        else None
+    )
 )
-
 if not PUBLIC_BASE_URL:
-    host = os.getenv("RENDER_EXTERNAL_HOSTNAME")
-    if host:
-        PUBLIC_BASE_URL = f"https://{host}"
-    else:
-        raise RuntimeError(
-            "Cannot determine public URL. "
-            "Set PUBLIC_BASE_URL in the environment."
-        )
+    raise RuntimeError("Cannot discover PUBLIC_BASE_URL")
 
 PUBLIC_BASE_URL = PUBLIC_BASE_URL.rstrip("/")
 
 DB_PATH = os.getenv("DB_PATH", "/db/rfq.sqlite")
 
-# ─────────────────── DATABASE (SQLite) ───────────────────────────────────
+# ───── DATABASE (SQLite) ────────────────────────────────────────────────
 engine = create_engine(
     f"sqlite:///{DB_PATH}",
     echo=False,
-    connect_args={"check_same_thread": False},  # async-friendly
+    connect_args={"check_same_thread": False},
 )
 
 
@@ -80,7 +76,7 @@ class Ticket(SQLModel, table=True):
     client_chat_id: int
     client_msg_id: Optional[int] = None
     trader_msg_id: Optional[int] = None
-    status: str = "open"          # open | quoted | expired | cancelled
+    status: str = "open"  # open | quoted | expired | cancelled
     price: Optional[float] = None
     valid_until: Optional[datetime] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -90,8 +86,8 @@ class Ticket(SQLModel, table=True):
 class TicketEvent(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     ticket_id: int = Field(index=True)
-    event: str                    # rfq_created | quoted | expired | cancelled
-    payload: Optional[str] = None # JSON string
+    event: str
+    payload: Optional[str] = None
     ts: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -115,11 +111,13 @@ def log_event(ticket_id: int, event: str, payload: dict | None = None) -> None:
         s.commit()
 
 
-# ─────────────────── TELEGRAM BOT ────────────────────────────────────────
+# ───── TELEGRAM BOT (PTB v22) ────────────────────────────────────────────
+defaults = Defaults(parse_mode=ParseMode.HTML)
+
 ptb: Application = (
     ApplicationBuilder()
     .token(BOT_TOKEN)
-    .parse_mode(ParseMode.HTML)   # ← enum instead of "HTML"
+    .defaults(defaults)
     .build()
 )
 
@@ -152,8 +150,8 @@ async def expire_worker(ticket_id: int, delay: int) -> None:
     log_event(ticket_id, "expired", {})
 
 
-# ─────────── /rfq (client) ───────────
-async def cmd_rfq(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+# ───── /rfq (client) ─────────────────────────────────────────────────────
+async def cmd_rfq(update, ctx):
     if update.effective_chat.id == ADMIN_CHAT_ID:
         await update.message.reply_text("Traders can’t issue RFQs here.")
         return
@@ -210,8 +208,8 @@ async def cmd_rfq(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(expire_worker(t.id, RFQ_TTL))
 
 
-# ─────────── /quote (trader) ───────────
-async def cmd_quote(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+# ───── /quote (trader) ───────────────────────────────────────────────────
+async def cmd_quote(update, ctx):
     if update.effective_chat.id != ADMIN_CHAT_ID:
         await update.message.reply_text("Only the trader group can quote.")
         return
@@ -272,7 +270,7 @@ async def cmd_quote(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 ptb.add_handler(CommandHandler("rfq", cmd_rfq))
 ptb.add_handler(CommandHandler("quote", cmd_quote))
 
-# ─────────────────── FASTAPI APP / WEBHOOK ───────────────────────────────
+# ───── FASTAPI APP / WEBHOOK ─────────────────────────────────────────────
 app = FastAPI()
 
 
@@ -299,12 +297,12 @@ async def telegram_webhook(req: Request):
         != WEBHOOK_SECRET
     ):
         raise HTTPException(status_code=401, detail="bad secret")
-    update = Update.de_json(await req.json(), ptb.bot)
+    update = ptb.schema_update(await req.json())
     await ptb.process_update(update)
     return Response(status_code=HTTPStatus.OK)
 
 
-# ─────────────────── EXISTING BINANCE ENDPOINTS ─────────────────────────
+# ───── EXISTING BINANCE ENDPOINTS (unchanged) ───────────────────────────
 @app.get("/")
 def health():
     return {"status": "alive"}
@@ -405,7 +403,7 @@ async def clearing_perp(symbol: str, quantity: float):
     )
     async with httpx.AsyncClient() as c:
         r = await c.get(url)
-    if r.status_code != 200:
+    if r.status_code != 0:
         raise HTTPException(502, "Failed to fetch perp orderbook")
     data = r.json()
     bids = [[float(p), float(q)] for p, q in data["bids"]]
