@@ -22,6 +22,7 @@ import httpx
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request, Response
 from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -116,7 +117,10 @@ def log_event(ticket_id: int, event: str, payload: dict | None = None) -> None:
 
 # ─────────────────── TELEGRAM BOT ────────────────────────────────────────
 ptb: Application = (
-    ApplicationBuilder().token(BOT_TOKEN).parse_mode("HTML").build()
+    ApplicationBuilder()
+    .token(BOT_TOKEN)
+    .parse_mode(ParseMode.HTML)   # ← enum instead of "HTML"
+    .build()
 )
 
 
