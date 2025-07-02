@@ -1,8 +1,7 @@
 """
-binance-fastapi + RFQ Telegram bot (python-telegram-bot v22, SQLite on /db)
+binance-fastapi + RFQ Telegram bot (python-telegram-bot 22 · SQLite on /db)
 
-ENV VARS (Render → Settings → Environment)
-------------------------------------------
+ENV VARS  ────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN      BotFather token
 WEBHOOK_SECRET      random string (same in setWebhook & header check)
 ADMIN_CHAT_ID       numeric ID of the traders group
@@ -32,7 +31,7 @@ from telegram.ext import (
 )
 from sqlmodel import SQLModel, Field, Session, create_engine
 
-# ───────────── CONFIG ────────────────────────────────────────────────────
+# ───────────────────── CONFIG ───────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN       = os.environ["TELEGRAM_TOKEN"]
@@ -55,7 +54,7 @@ PUBLIC_BASE_URL = PUBLIC_BASE_URL.rstrip("/")
 
 DB_PATH = os.getenv("DB_PATH", "/db/rfq.sqlite")
 
-# ───────────── DATABASE (SQLite) ─────────────────────────────────────────
+# ───────────────────── DATABASE ─────────────────────────────────────────
 engine = create_engine(
     f"sqlite:///{DB_PATH}",
     echo=False,
@@ -95,12 +94,12 @@ def log_event(ticket_id: int, event: str, payload: dict | None = None) -> None:
             TicketEvent(
                 ticket_id=ticket_id,
                 event=event,
-                payload=json.dumps(payload) if payload is not None else None,
+                payload=json.dumps(payload) if payload else None,
             )
         )
         s.commit()
 
-# ───────────── TELEGRAM BOT (PTB v22) ────────────────────────────────────
+# ───────────────────── TELEGRAM BOT ─────────────────────────────────────
 defaults = Defaults(parse_mode=ParseMode.HTML)
 
 ptb: Application = (
@@ -110,7 +109,6 @@ ptb: Application = (
     .build()
 )
 
-# ─── helper to expire quotes ─────────────────────────────────────────────
 async def expire_worker(ticket_id: int, delay: int) -> None:
     await asyncio.sleep(delay)
     with db() as s:
@@ -123,7 +121,6 @@ async def expire_worker(ticket_id: int, delay: int) -> None:
         t.updated_at = datetime.utcnow()
         s.add(t)
         s.commit()
-    # notify chats
     if t.trader_msg_id:
         await ptb.bot.edit_message_text(
             chat_id=ADMIN_CHAT_ID,
@@ -138,7 +135,7 @@ async def expire_worker(ticket_id: int, delay: int) -> None:
         )
     log_event(ticket_id, "expired", {})
 
-# ─── /rfq handler (client side) ──────────────────────────────────────────
+# ─────────── /rfq (client) ──────────────────────────────────────────────
 async def cmd_rfq(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id == ADMIN_CHAT_ID:
         await update.message.reply_text("Traders can’t issue RFQs here.")
@@ -183,7 +180,7 @@ async def cmd_rfq(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"📥 <b>RFQ #{t.id}</b>\n"
             f"{update.effective_chat.title or update.effective_chat.id} wants "
             f"{side.upper()} {qty} {symbol}\n\n"
-            f"Respond with:\n/quote {t.id} <price> <secs>"
+            f"<code>/quote {t.id} price secs</code>"  # ← fixed: no raw < > tags
         ),
     )
 
@@ -195,7 +192,7 @@ async def cmd_rfq(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     asyncio.create_task(expire_worker(t.id, RFQ_TTL))
 
-# ─── /quote handler (trader side) ────────────────────────────────────────
+# ─────────── /quote (trader) ────────────────────────────────────────────
 async def cmd_quote(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != ADMIN_CHAT_ID:
         await update.message.reply_text("Only the trader group can quote.")
@@ -256,23 +253,21 @@ async def cmd_quote(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     asyncio.create_task(expire_worker(ticket_id, secs))
 
-# register handlers
-ptb.add_handler(CommandHandler("rfq", cmd_rfq))
+ptb.add_handler(CommandHandler("rfq",   cmd_rfq))
 ptb.add_handler(CommandHandler("quote", cmd_quote))
 
-# ───────────── FASTAPI APP / WEBHOOK ─────────────────────────────────────
+# ───────────────────── FASTAPI / WEBHOOK ────────────────────────────────
 app = FastAPI()
 
 @app.on_event("startup")
 async def _startup() -> None:
     init_db()
-    # set Telegram webhook
     url = f"{PUBLIC_BASE_URL}/telegram"
     await ptb.bot.set_webhook(url, secret_token=WEBHOOK_SECRET,
                               drop_pending_updates=True)
     logging.info("Webhook set to %s", url)
-    await ptb.initialize()            # PTB v22 needs explicit init
-    asyncio.create_task(ptb.start())  # then keep polling updates
+    await ptb.initialize()
+    asyncio.create_task(ptb.start())
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
@@ -280,15 +275,13 @@ async def _shutdown() -> None:
 
 @app.post("/telegram")
 async def telegram_webhook(req: Request):
-    # Telegram authenticity
     if req.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
         raise HTTPException(401, "bad secret")
-    # PTB v22: build Update manually
     update = Update.de_json(await req.json(), ptb.bot)
     await ptb.process_update(update)
     return Response(status_code=HTTPStatus.OK)
 
-# ───────────── HEALTH & BINANCE ENDPOINTS (unchanged) ───────────────────
+# ───────────────────── Health & Binance helpers ─────────────────────────
 @app.get("/")
 def health(): return {"status": "alive"}
 
@@ -332,14 +325,16 @@ async def realized_vol(symbol: str):
     vol = np.std(returns) * np.sqrt(365)
     return {"symbol": symbol.upper(), "realized_vol_%": round(vol * 100, 2)}
 
-def clearing(order_book: list[list[float]], qty: float):
+def _clearing(order_book: list[list[float]], qty: float):
     filled, cost = 0.0, 0.0
     for price, size in order_book:
         take = min(qty - filled, size)
         cost += take * price
         filled += take
-        if filled >= qty: break
-    if filled == 0: return {"error": "no liquidity"}
+        if filled >= qty:
+            break
+    if filled == 0:
+        return {"error": "no liquidity"}
     avg = cost / filled
     return {
         "filled": filled,
@@ -362,8 +357,8 @@ async def clearing_spot(symbol: str, quantity: float):
         "symbol": symbol.upper(),
         "venue": "spot",
         "quantity": quantity,
-        "bid": clearing(bids, quantity),
-        "ask": clearing(asks, quantity),
+        "bid": _clearing(bids, quantity),
+        "ask": _clearing(asks, quantity),
     }
 
 @app.get("/clearing/perp/{symbol}")
@@ -380,6 +375,6 @@ async def clearing_perp(symbol: str, quantity: float):
         "symbol": symbol.upper(),
         "venue": "perp",
         "quantity": quantity,
-        "bid": clearing(bids, quantity),
-        "ask": clearing(asks, quantity),
+        "bid": _clearing(bids, quantity),
+        "ask": _clearing(asks, quantity),
     }
