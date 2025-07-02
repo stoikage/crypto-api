@@ -2,6 +2,13 @@ services:
   - type: web
     name: binance-fastapi
     env: python
+    pythonVersion: "3.12"             # ← good practice; keeps builds reproducible
     buildCommand: "pip install -r requirements.txt"
     startCommand: "uvicorn main:app --host 0.0.0.0 --port 10000"
     plan: free
+
+    # ── persistent volume ───────────────────────────────────────────────
+    disk:
+      name: rfq-data                  # any slug; appears in the dashboard
+      mountPath: /db                  # <-- **your** chosen path
+      sizeGB: 1                       # matches the disk you created

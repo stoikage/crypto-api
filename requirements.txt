@@ -2,3 +2,6 @@ fastapi
 uvicorn
 httpx
 numpy
+python-telegram-bot==22.2
+sqlmodel==0.0.16    
+aiosqlite==0.20.0
