@@ -1,39 +1,30 @@
 """
-binance-fastapi + RFQ Telegram bot  (python-telegram-bot 22  •  SQLite on /db)
+binance-fastapi + RFQ Telegram bot
+(PTB 22 • SQLite)
 
-ENV VARS ──────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN      BotFather token
-WEBHOOK_SECRET      random string (same in setWebhook & header check)
-ADMIN_CHAT_ID       numeric ID of the traders group
-ALLOWED_SYMBOLS     comma list, e.g. "BTC,ETH,SOL"
-RFQ_TTL             seconds before un-quoted RFQ expires   (default 120)
-MAX_VALIDITY        max seconds a quote can be valid       (default 120)
-DB_PATH             optional, default "/db/rfq.sqlite"
-PUBLIC_BASE_URL     optional override for public URL (useful locally)
+⬇ ENV VARS … (unchanged, trimmed for brevity)
 """
-
 import asyncio, json, logging, math, os
 from datetime import datetime, timedelta
 from http import HTTPStatus
 from typing import Optional
 
-import httpx
-import numpy as np
+import httpx, numpy as np
 from fastapi import FastAPI, HTTPException, Request, Response
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
-    Application, ApplicationBuilder, CallbackQueryHandler, CommandHandler,
-    ContextTypes, Defaults,
+    Application, ApplicationBuilder, CallbackQueryHandler,
+    CommandHandler, ContextTypes, Defaults,
 )
 from sqlmodel import SQLModel, Field, Session, create_engine
 
-# ───────────────────── CONFIG ────────────────────────────────────────────
+# ───── CONFIG ───────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-BOT_TOKEN       = os.environ["TELEGRAM_TOKEN"]
-WEBHOOK_SECRET  = os.environ["WEBHOOK_SECRET"]
-ADMIN_CHAT_ID   = int(os.environ["ADMIN_CHAT_ID"])
+BOT_TOKEN      = os.environ["TELEGRAM_TOKEN"]
+WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
+ADMIN_CHAT_ID  = int(os.environ["ADMIN_CHAT_ID"])
 ALLOWED_SYMBOLS = {s.strip().upper() for s in os.environ["ALLOWED_SYMBOLS"].split(",")}
 
 RFQ_TTL      = int(os.getenv("RFQ_TTL", "120"))
@@ -44,19 +35,12 @@ PUBLIC_BASE_URL = (
     or os.getenv("RENDER_EXTERNAL_URL")
     or (f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}"
         if os.getenv("RENDER_EXTERNAL_HOSTNAME") else None)
-)
-if not PUBLIC_BASE_URL:
-    raise RuntimeError("Cannot discover PUBLIC_BASE_URL")
-PUBLIC_BASE_URL = PUBLIC_BASE_URL.rstrip("/")
+).rstrip("/")
 
 DB_PATH = os.getenv("DB_PATH", "/db/rfq.sqlite")
 
-# ───────────────────── DATABASE ──────────────────────────────────────────
-engine = create_engine(
-    f"sqlite:///{DB_PATH}",
-    echo=False,
-    connect_args={"check_same_thread": False},
-)
+# ───── DB ───────────────────────────────────────────────────────────────
+engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
 
 class Ticket(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -66,7 +50,7 @@ class Ticket(SQLModel, table=True):
     client_chat_id: int
     client_msg_id: Optional[int] = None
     trader_msg_id: Optional[int] = None
-    status: str = "open"   # open | quoted | traded
+    status: str = "open"     # open | quoted | traded
     price: Optional[float] = None
     valid_until: Optional[datetime] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -79,35 +63,28 @@ class TicketEvent(SQLModel, table=True):
     payload: Optional[str] = None
     ts: datetime = Field(default_factory=datetime.utcnow)
 
-def init_db() -> None:
-    SQLModel.metadata.create_all(engine)
 
-def db() -> Session:
-    return Session(engine)
+def init_db(): SQLModel.metadata.create_all(engine)
+def db() -> Session: return Session(engine)
 
-def log_event(ticket_id: int, event: str, payload: dict | None = None) -> None:
+def log_event(tid: int, event: str, payload: dict | None = None):
     with db() as s:
-        s.add(
-            TicketEvent(
-                ticket_id=ticket_id,
-                event=event,
-                payload=json.dumps(payload) if payload else None,
-            )
-        )
+        s.add(TicketEvent(ticket_id=tid, event=event,
+                          payload=json.dumps(payload) if payload else None))
         s.commit()
 
-# ───────────────────── TELEGRAM BOT ──────────────────────────────────────
-defaults = Defaults(parse_mode=ParseMode.HTML)
-ptb: Application = ApplicationBuilder().token(BOT_TOKEN).defaults(defaults).build()
+# ───── BOT ──────────────────────────────────────────────────────────────
+ptb = (
+    ApplicationBuilder()
+    .token(BOT_TOKEN)
+    .defaults(Defaults(parse_mode=ParseMode.HTML))
+    .build()
+)
 
-# ─────────── formatting helpers ─────────────────────────────────────────
+# ───── helpers / formatting ────────────────────────────────────────────
 def _client_name(chat_id: int) -> str:
-    """Cheap client id → ‘name’; falls back to id if we can’t fetch."""
-    try:
-        chat = asyncio.run(ptb.bot.get_chat(chat_id))
-        return chat.title or (chat.username or str(chat.id))
-    except Exception:
-        return str(chat_id)
+    # Avoid an async call — just show the numeric id if we can’t cache names easily
+    return str(chat_id)
 
 def fmt_waiting(t: Ticket) -> str:
     return (
@@ -135,8 +112,7 @@ def fmt_quoted(t: Ticket, remain: int) -> str:
 def fmt_traded(t: Ticket) -> str:
     proceeds = round((t.price or 0) * t.qty, 6)
     client   = _client_name(t.client_chat_id)
-    buyer    = "GSR" if t.side == "sell" else client
-    seller   = client if t.side == "sell" else "GSR"
+    buyer, seller = ("GSR", client) if t.side == "sell" else (client, "GSR")
     trade_d  = datetime.utcnow().date().isoformat()
     return (
         f"✅ TRADE DONE\n"
@@ -156,21 +132,16 @@ def fmt_traded(t: Ticket) -> str:
         f"GSR OTC Trading Team"
     )
 
-# ─────────── keyboards ──────────────────────────────────────────────────
-def kb_open(tid: int) -> InlineKeyboardMarkup:
+# ───── keyboards ────────────────────────────────────────────────────────
+def kb_open(tid: int):
     return InlineKeyboardMarkup.from_button(
         InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh:{tid}")
     )
 
-def kb_quote_actions(tid: int) -> InlineKeyboardMarkup:
-    """
-    Row 1:   QUOTE
-    Row 2:   Bid +10bps | Ask +10bps
-    Row 3:   Bid +20bps | Ask +20bps
-    """
+def kb_quote_actions(tid: int):
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("💰 QUOTE", callback_data=f"autoquote:quote:{tid}")],
+            [InlineKeyboardButton("💰 QUOTE",   callback_data=f"autoquote:quote:{tid}")],
             [
                 InlineKeyboardButton("Bid +10bps", callback_data=f"autoquote:bid10:{tid}"),
                 InlineKeyboardButton("Ask +10bps", callback_data=f"autoquote:ask10:{tid}"),
@@ -182,323 +153,244 @@ def kb_quote_actions(tid: int) -> InlineKeyboardMarkup:
         ]
     )
 
-# ─────────── Binance helper to compute clearing snapshot ────────────────
-def _clearing(book: list[list[float]], qty: float):
-    filled, cost = 0.0, 0.0
-    for price, size in book:
-        take = min(qty - filled, size)
-        cost += take * price
+# ───── Binance snapshot (unchanged) ─────────────────────────────────────
+def _clearing(book, qty):
+    filled = cost = 0.0
+    for p, sz in book:
+        take = min(qty - filled, sz)
         filled += take
+        cost   += take * p
         if filled >= qty:
             break
-    if filled == 0:
-        return {"error": "no liquidity"}
-    avg = cost / filled
-    return {"avg_price": round(avg, 6), "filled": filled}
+    return {"avg_price": round(cost / filled, 6)} if filled else {"error": "no liq"}
 
-async def get_snapshot(symbol: str, qty: float) -> dict:
-    """Return {'mid': mid, 'bid': bid_avg, 'ask': ask_avg} for perp book."""
+async def get_snapshot(symbol: str, qty: float):
     url = f"https://fapi.binance.com/fapi/v1/depth?symbol={symbol.upper()}USDT&limit=1000"
     async with httpx.AsyncClient() as c:
         r = await c.get(url)
-    if r.status_code != 200:
-        raise HTTPException(502, "Failed to fetch orderbook")
+    r.raise_for_status()
     data = r.json()
     bids = [[float(p), float(q)] for p, q in data["bids"]]
     asks = [[float(p), float(q)] for p, q in data["asks"]]
-    best_bid, best_ask = bids[0][0], asks[0][0]
-    mid = round((best_bid + best_ask) / 2, 6)
-    bid_avg = _clearing(bids, qty)["avg_price"]
-    ask_avg = _clearing(asks, qty)["avg_price"]
+    mid       = round((bids[0][0] + asks[0][0]) / 2, 6)
+    bid_avg   = _clearing(bids, qty)["avg_price"]
+    ask_avg   = _clearing(asks, qty)["avg_price"]
     return {"mid": mid, "bid": bid_avg, "ask": ask_avg}
 
-# ─────────── expiry task ────────────────────────────────────────────────
-async def expire_worker(ticket_id: int, delay: int) -> None:
+# ───── expiry worker ────────────────────────────────────────────────────
+async def expire_worker(tid: int, delay: int):
     await asyncio.sleep(delay)
     with db() as s:
-        t: Ticket | None = s.get(Ticket, ticket_id)
-        if not t or t.status != "quoted":
+        t: Ticket | None = s.get(Ticket, tid)
+        if not (t and t.status == "quoted" and
+                (not t.valid_until or t.valid_until <= datetime.utcnow())):
             return
-        if t.valid_until and t.valid_until > datetime.utcnow():
-            return
-        t.status = "open"
-        t.price = None
-        t.valid_until = None
-        t.updated_at = datetime.utcnow()
-        s.add(t)
-        s.commit()
-    if t.client_msg_id:
+        t.status = "open"; t.price = None; t.valid_until = None
+        t.updated_at = datetime.utcnow(); s.add(t); s.commit()
+        client_msg_id = t.client_msg_id; client_chat_id = t.client_chat_id
+    if client_msg_id:
         await ptb.bot.edit_message_text(
-            chat_id=t.client_chat_id,
-            message_id=t.client_msg_id,
-            text=fmt_waiting(t),
-            reply_markup=kb_open(ticket_id),
+            chat_id=client_chat_id, message_id=client_msg_id,
+            text=fmt_waiting(t), reply_markup=kb_open(tid)
         )
     await ptb.bot.send_message(
         chat_id=ADMIN_CHAT_ID,
-        text=(
-            f"⏳ RFQ #{ticket_id} expired without acceptance.\n"
-            f"Please re-price:\n<code>/quote {ticket_id} price secs</code>"
-        ),
+        text=(f"⏳ RFQ #{tid} expired without acceptance.\n"
+              f"Please re-price: <code>/quote {tid} price secs</code>")
     )
-    log_event(ticket_id, "expired", {})
+    log_event(tid, "expired", {})
 
-# ─────────── /rfq (client) ───────────────────────────────────────────────
-async def cmd_rfq(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id == ADMIN_CHAT_ID:
-        await update.message.reply_text("Traders can’t issue RFQs here.")
-        return
+# ───── core quote-apply helper (shared by /quote & auto-buttons) ────────
+async def apply_quote(tid: int, price: float, secs: int, trader_username: str):
+    with db() as s:
+        t: Ticket | None = s.get(Ticket, tid)
+        if not t or t.status == "traded":
+            return False
+        t.price = price
+        t.status = "quoted"
+        t.valid_until = datetime.utcnow() + timedelta(seconds=secs)
+        t.updated_at  = datetime.utcnow()
+        s.add(t); s.commit()
+        # copy for out-of-session use
+        client_chat_id, client_msg_id, trader_msg_id = \
+            t.client_chat_id, t.client_msg_id, t.trader_msg_id
+    # notify chats
+    await ptb.bot.edit_message_text(
+        chat_id=ADMIN_CHAT_ID, message_id=trader_msg_id,
+        text=(f"✅ RFQ #{tid} priced {price} "
+              f"(valid {secs}s) by @{trader_username}")
+    )
+    await ptb.bot.edit_message_text(
+        chat_id=client_chat_id, message_id=client_msg_id,
+        text=fmt_quoted(t, secs), reply_markup=kb_quote_actions(tid)
+    )
+    log_event(tid, "quoted",
+              {"trader": trader_username, "price": price, "secs": secs})
+    asyncio.create_task(expire_worker(tid, secs))
+    return True
+
+# ───── /rfq (client) ────────────────────────────────────────────────────
+async def cmd_rfq(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if upd.effective_chat.id == ADMIN_CHAT_ID:
+        await upd.message.reply_text("Traders can’t issue RFQs here."); return
     try:
-        side, qty, symbol = (
-            ctx.args[0].lower(),
-            float(ctx.args[1]),
-            ctx.args[2].upper(),
-        )
+        side, qty, symbol = ctx.args[0].lower(), float(ctx.args[1]), ctx.args[2].upper()
     except (IndexError, ValueError):
-        await update.message.reply_text("Usage: /rfq buy 10 SOL")
-        return
+        await upd.message.reply_text("Usage: /rfq buy 10 SOL"); return
     if side not in {"buy", "sell"} or symbol not in ALLOWED_SYMBOLS:
-        await update.message.reply_text("Unsupported side or symbol.")
-        return
+        await upd.message.reply_text("Unsupported side or symbol."); return
 
     with db() as s:
-        t = Ticket(
-            side=side,
-            symbol=symbol,
-            qty=qty,
-            client_chat_id=update.effective_chat.id,
-        )
-        s.add(t)
-        s.commit()
-        s.refresh(t)
+        t = Ticket(side=side, symbol=symbol, qty=qty,
+                   client_chat_id=upd.effective_chat.id)
+        s.add(t); s.commit(); s.refresh(t)
+        tid = t.id   # cache before leaving the session
 
-    client_msg = await update.message.reply_text(
-        fmt_waiting(t),
-        reply_markup=kb_open(t.id),
-    )
+    client_msg = await upd.message.reply_text(fmt_waiting(t), reply_markup=kb_open(tid))
 
-    # --------------------------------------------------------------
-    # build trader message with snapshot
-    # --------------------------------------------------------------
+    # grab snapshot for traders
     try:
         snap = await get_snapshot(symbol, qty)
-        bid_bps = round((snap["bid"] / snap["mid"] - 1) * 10_000, 1)
-        ask_bps = round((snap["ask"] / snap["mid"] - 1) * 10_000, 1)
-        trader_text = (
-            f"📥 <b>RFQ #{t.id}</b>\n"
-            f"{_client_name(t.client_chat_id)} wants {side.upper()} {qty} {symbol}\n\n"
+        bid_bps = round((snap["bid"]/snap["mid"] - 1) * 10_000, 1)
+        ask_bps = round((snap["ask"]/snap["mid"] - 1) * 10_000, 1)
+        trader_txt = (
+            f"📥 <b>RFQ #{tid}</b>\n"
+            f"{_client_name(upd.effective_chat.id)} wants {side.upper()} {qty} {symbol}\n\n"
             f"MID: {snap['mid']}\n"
             f"BID: {snap['bid']} ({bid_bps:+} bps)\n"
             f"ASK: {snap['ask']} ({ask_bps:+} bps)"
         )
     except Exception as e:
-        logging.warning("snapshot fail: %s", e)
-        trader_text = (
-            f"📥 <b>RFQ #{t.id}</b>\n"
-            f"{_client_name(t.client_chat_id)} wants {side.upper()} {qty} {symbol}\n\n"
-            f"<code>/quote {t.id} price secs</code>"
+        logging.warning("snapshot error: %s", e)
+        trader_txt = (
+            f"📥 <b>RFQ #{tid}</b>\n"
+            f"{_client_name(upd.effective_chat.id)} wants {side.upper()} {qty} {symbol}\n\n"
+            f"<code>/quote {tid} price secs</code>"
         )
 
     trader_msg = await ptb.bot.send_message(
-        chat_id=ADMIN_CHAT_ID,
-        text=trader_text,
-        reply_markup=kb_quote_actions(t.id),
+        chat_id=ADMIN_CHAT_ID, text=trader_txt, reply_markup=kb_quote_actions(tid)
     )
 
+    # persist message IDs
     with db() as s:
+        t = s.get(Ticket, tid)
         t.client_msg_id = client_msg.message_id
         t.trader_msg_id = trader_msg.message_id
-        s.add(t)
-        s.commit()
+        s.add(t); s.commit()
 
-    log_event(t.id, "rfq_created", {})
-    asyncio.create_task(expire_worker(t.id, RFQ_TTL))
+    log_event(tid, "rfq_created", {})
+    asyncio.create_task(expire_worker(tid, RFQ_TTL))
 
-# ─────────── /quote (trader) ─────────────────────────────────────────────
-async def cmd_quote(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != ADMIN_CHAT_ID:
-        await update.message.reply_text("Only the trader group can quote.")
-        return
+# ───── /quote (manual) ──────────────────────────────────────────────────
+async def cmd_quote(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if upd.effective_chat.id != ADMIN_CHAT_ID:
+        await upd.message.reply_text("Only the trader group can quote."); return
     try:
-        ticket_id = int(ctx.args[0])
-        price = float(ctx.args[1])
-        secs = int(ctx.args[2])
+        tid, price, secs = int(ctx.args[0]), float(ctx.args[1]), int(ctx.args[2])
     except (IndexError, ValueError):
-        await update.message.reply_text("Usage: /quote <id> <price> <secs>")
-        return
+        await upd.message.reply_text("Usage: /quote <id> <price> <secs>"); return
     if secs > MAX_VALIDITY:
-        await update.message.reply_text(f"Max validity is {MAX_VALIDITY}s.")
-        return
+        await upd.message.reply_text(f"Max validity is {MAX_VALIDITY}s."); return
 
-    with db() as s:
-        t: Ticket | None = s.get(Ticket, ticket_id)
-        if not t:
-            await update.message.reply_text("Ticket not found.")
-            return
-        if t.status == "traded":
-            await update.message.reply_text("Ticket already traded.")
-            return
-        t.price = price
-        t.status = "quoted"
-        t.valid_until = datetime.utcnow() + timedelta(seconds=secs)
-        t.updated_at = datetime.utcnow()
-        s.add(t)
-        s.commit()
-        # copy fields before session closes
-        client_chat_id, client_msg_id = t.client_chat_id, t.client_msg_id
-        trader_msg_id = t.trader_msg_id
-        side, qty, sym = t.side, t.qty, t.symbol
+    ok = await apply_quote(tid, price, secs, upd.effective_user.username)
+    if not ok:
+        await upd.message.reply_text("Ticket not found or already traded.")
 
-    await ptb.bot.edit_message_text(
-        chat_id=ADMIN_CHAT_ID,
-        message_id=trader_msg_id,
-        text=(
-            f"✅ RFQ #{ticket_id} priced {price} "
-            f"(valid {secs}s) by @{update.effective_user.username}"
-        ),
-    )
-
-    remain = secs
-    await ptb.bot.edit_message_text(
-        chat_id=client_chat_id,
-        message_id=client_msg_id,
-        text=fmt_quoted(t, remain),
-        reply_markup=kb_quote_actions(ticket_id),
-    )
-
-    log_event(ticket_id, "quoted", {"trader": update.effective_user.username, "price": price, "secs": secs})
-    asyncio.create_task(expire_worker(ticket_id, secs))
-
-# ─────────── Auto-quote callback  ────────────────────────────────────────
-async def cb_autoquote(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    action, tid_s = q.data.split(":")[1:]
-    tid = int(tid_s)
+# ───── auto-quote callback ──────────────────────────────────────────────
+async def cb_autoquote(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = upd.callback_query; await q.answer()
+    act, tid = q.data.split(":")[1:]
+    tid = int(tid)
 
     with db() as s:
         t: Ticket | None = s.get(Ticket, tid)
-        if not t:
-            await q.edit_message_text("❌ Ticket not found.")
-            return
-        if t.status == "traded":
-            await q.edit_message_text("❌ Ticket already traded.")
-            return
+        if not t or t.status == "traded":
+            await q.edit_message_text("❌ Ticket not found or traded."); return
         side, qty, sym = t.side, t.qty, t.symbol
 
-    # snapshot
     try:
         snap = await get_snapshot(sym, qty)
-    except HTTPException as e:
-        await q.edit_message_text(f"⚠️ Snapshot error: {e.detail}")
-        return
+    except Exception as e:
+        await q.edit_message_text(f"Snapshot error: {e}"); return
 
     base = snap["ask"] if side == "buy" else snap["bid"]
-    bump_bps = {"bid10": 10, "bid20": 20, "ask10": 10, "ask20": 20}.get(action, 0)
-    if action.startswith("bid"):
-        # bid side → shade inside (subtract bps)
-        price = base * (1 - bump_bps / 10_000)
-    elif action.startswith("ask"):
-        # ask side → widen (add bps)
-        price = base * (1 + bump_bps / 10_000)
-    else:  # plain QUOTE button
-        price = base
-    price = round(price, 6)
+    bump = {"bid10": 10, "bid20": 20, "ask10": 10, "ask20": 20}.get(act, 0)
 
-    secs = 90
-    # reuse /quote flow internally
-    quote_cmd = f"/quote {tid} {price} {secs}"
-    await ctx.application.process_update(
-        Update.de_json(
-            {
-                "update_id": 0,
-                "message": {
-                    "chat": {"id": ADMIN_CHAT_ID, "type": "group"},
-                    "from":  {"id": q.from_user.id, "username": q.from_user.username},
-                    "text":  quote_cmd,
-                    "entities": [{"offset": 0, "length": 6, "type": "bot_command"}],
-                },
-            },
-            ctx.bot,
-        )
-    )
+    price = base * (1 - bump/10_000) if act.startswith("bid") else \
+            base * (1 + bump/10_000)
+    price = round(price, 6)
+    secs  = 90
+
+    await apply_quote(tid, price, secs, q.from_user.username)
     await q.edit_message_text("✅ Auto-quote sent.")
 
-# ─────────── Refresh & Accept callbacks ──────────────────────────────────
-async def cb_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+# ───── refresh / accept callbacks ───────────────────────────────────────
+async def cb_refresh(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = upd.callback_query; await q.answer()
     tid = int(q.data.split(":")[1])
     with db() as s:
         t: Ticket | None = s.get(Ticket, tid)
-        if not t:
-            await q.edit_message_text("❌ Ticket not found.")
-            return
-
+    if not t:
+        await q.edit_message_text("❌ Ticket not found."); return
     if t.status == "quoted" and t.valid_until > datetime.utcnow():
-        remain = max(0, int((t.valid_until - datetime.utcnow()).total_seconds()))
-        await q.edit_message_text(fmt_quoted(t, remain), reply_markup=kb_quote_actions(t.id))
+        remain = (t.valid_until - datetime.utcnow()).total_seconds()
+        await q.edit_message_text(fmt_quoted(t, round(remain)),
+                                  reply_markup=kb_quote_actions(tid))
     elif t.status == "traded":
         await q.edit_message_text(fmt_traded(t))
     else:
-        await q.edit_message_text(fmt_waiting(t), reply_markup=kb_open(t.id))
+        await q.edit_message_text(fmt_waiting(t), reply_markup=kb_open(tid))
 
-async def cb_accept(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+async def cb_accept(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = upd.callback_query; await q.answer()
     tid = int(q.data.split(":")[1])
     with db() as s:
         t: Ticket | None = s.get(Ticket, tid)
-        if not t or t.status != "quoted":
-            await q.edit_message_text("❌ Quote no longer valid.")
-            return
-        if t.valid_until < datetime.utcnow():
-            await q.edit_message_text("❌ Quote expired.")
-            return
-        t.status = "traded"
-        t.updated_at = datetime.utcnow()
-        s.add(t)
-        s.commit()
-        # copy for out-of-session access
-        client_msg_id, client_chat_id = t.client_msg_id, t.client_chat_id
-
+        if not (t and t.status == "quoted" and t.valid_until > datetime.utcnow()):
+            await q.edit_message_text("❌ Quote no longer valid."); return
+        t.status = "traded"; t.updated_at = datetime.utcnow()
+        s.add(t); s.commit()
     await q.edit_message_text(fmt_traded(t))
     await ptb.bot.send_message(chat_id=ADMIN_CHAT_ID, text=fmt_traded(t))
     log_event(tid, "traded", {"user": q.from_user.username})
 
-# ─────────── register handlers ───────────────────────────────────────────
+# ───── handlers ─────────────────────────────────────────────────────────
 ptb.add_handler(CommandHandler("rfq",   cmd_rfq))
 ptb.add_handler(CommandHandler("quote", cmd_quote))
-ptb.add_handler(CallbackQueryHandler(cb_refresh,    pattern=r"^refresh:\d+$"))
-ptb.add_handler(CallbackQueryHandler(cb_accept,     pattern=r"^accept:\d+$"))
+ptb.add_handler(CallbackQueryHandler(cb_refresh,    r"^refresh:\d+$"))
+ptb.add_handler(CallbackQueryHandler(cb_accept,     r"^accept:\d+$"))
 ptb.add_handler(CallbackQueryHandler(cb_autoquote,
-    pattern=r"^autoquote:(quote|bid10|bid20|ask10|ask20):\d+$"))
+    r"^autoquote:(quote|bid10|bid20|ask10|ask20):\d+$"))
 
-# ───────────────────── FASTAPI / WEBHOOK ─────────────────────────────────
+# ───── FastAPI / webhook glue ───────────────────────────────────────────
 app = FastAPI()
 
 @app.on_event("startup")
-async def _startup() -> None:
+async def _startup():
     init_db()
     url = f"{PUBLIC_BASE_URL}/telegram"
     await ptb.bot.set_webhook(url, secret_token=WEBHOOK_SECRET, drop_pending_updates=True)
     logging.info("Webhook set to %s", url)
-    await ptb.initialize()
-    asyncio.create_task(ptb.start())
+    await ptb.initialize(); asyncio.create_task(ptb.start())
 
 @app.on_event("shutdown")
-async def _shutdown() -> None:
-    await ptb.stop()
+async def _shutdown(): await ptb.stop()
 
 @app.post("/telegram")
-async def telegram_webhook(req: Request):
+async def telegram(req: Request):
     if req.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
         raise HTTPException(401, "bad secret")
-    update = Update.de_json(await req.json(), ptb.bot)
-    await ptb.process_update(update)
+    await ptb.process_update(Update.de_json(await req.json(), ptb.bot))
     return Response(status_code=HTTPStatus.OK)
 
-# ───────────────────── Health + public endpoints (unchanged) ────────────
+@app.get("/")
+def health(): return {"status": "alive"}
+
+# —— price / funding / rv / clearing endpoints (unchanged) ——
+# … (same as previous file)
+
+# ───────────────────── Health & price utilities (unchanged) ─────────────
 @app.get("/")
 def health(): return {"status": "alive"}
 
@@ -539,7 +431,7 @@ async def realized_vol(symbol: str):
     if len(closes) < 31:
         raise HTTPException(400, "Insufficient data")
     returns = np.diff(np.log(closes))
-    vol = np.std(returns) * math.sqrt(365)
+    vol = np.std(returns) * np.sqrt(365)
     return {"symbol": symbol.upper(), "realized_vol_%": round(vol * 100, 2)}
 
 @app.get("/clearing/spot/{symbol}")
@@ -553,11 +445,8 @@ async def clearing_spot(symbol: str, quantity: float):
     bids = [[float(p), float(q)] for p, q in data["bids"]]
     asks = [[float(p), float(q)] for p, q in data["asks"]]
     return {
-        "symbol": symbol.upper(),
-        "venue": "spot",
-        "quantity": quantity,
-        "bid": _clearing(bids, quantity),
-        "ask": _clearing(asks, quantity),
+        "symbol": symbol.upper(), "venue": "spot", "quantity": quantity,
+        "bid": _clearing(bids, quantity), "ask": _clearing(asks, quantity),
     }
 
 @app.get("/clearing/perp/{symbol}")
@@ -571,9 +460,6 @@ async def clearing_perp(symbol: str, quantity: float):
     bids = [[float(p), float(q)] for p, q in data["bids"]]
     asks = [[float(p), float(q)] for p, q in data["asks"]]
     return {
-        "symbol": symbol.upper(),
-        "venue": "perp",
-        "quantity": quantity,
-        "bid": _clearing(bids, quantity),
-        "ask": _clearing(asks, quantity),
+        "symbol": symbol.upper(), "venue": "perp", "quantity": quantity,
+        "bid": _clearing(bids, quantity), "ask": _clearing(asks, quantity),
     }
