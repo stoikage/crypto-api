@@ -431,3 +431,85 @@ async def clearing_perp(symbol: str, quantity: float):
     asks = [[float(p), float(q)] for p, q in data["asks"]]
     return {"symbol": symbol.upper(), "venue": "perp", "quantity": quantity,
             "bid": _clearing(bids, quantity), "ask": _clearing(asks, quantity)}
+
+
+# ───────────────────── Health & Binance helpers (unchanged) ─────────────
+@app.get("/")
+def health(): return {"status": "alive"}
+
+@app.get("/price/{symbol}")
+async def price(symbol: str):
+    url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol.upper()}"
+    async with httpx.AsyncClient() as c:
+        r = await c.get(url)
+    if r.status_code != 200:
+        raise HTTPException(502, "Binance ticker unavailable")
+    return {"symbol": symbol.upper(), "price": float(r.json()["price"])}
+
+@app.get("/funding/{symbol}")
+async def funding(symbol: str):
+    url = f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={symbol.upper()}"
+    async with httpx.AsyncClient() as c:
+        r = await c.get(url)
+    if r.status_code != 200:
+        raise HTTPException(502, "Binance funding unavailable")
+    j = r.json()
+    return {
+        "symbol": j["symbol"],
+        "markPrice": float(j["markPrice"]),
+        "lastFundingRate": float(j["lastFundingRate"]),
+        "nextFundingTime": int(j["nextFundingTime"]),
+    }
+
+@app.get("/rv/{symbol}")
+async def realized_vol(symbol: str):
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol.upper()}&interval=1d&limit=31"
+    async with httpx.AsyncClient() as c:
+        r = await c.get(url)
+    if r.status_code != 200:
+        raise HTTPException(502, "Failed to fetch price history")
+    closes = [float(item[4]) for item in r.json()]
+    if len(closes) < 31:
+        raise HTTPException(400, "Insufficient data")
+    returns = np.diff(np.log(closes))
+    vol = np.std(returns) * np.sqrt(365)
+    return {"symbol": symbol.upper(), "realized_vol_%": round(vol * 100, 2)}
+
+def _clearing(book: list[list[float]], qty: float):
+    filled = cost = 0.0
+    for price, size in book:
+        take = min(qty - filled, size)
+        cost += take * price; filled += take
+        if filled >= qty:
+            break
+    if filled == 0: return {"error": "no liquidity"}
+    return {
+        "filled": filled,
+        "avg_price": round(cost / filled, 6),
+        "total_cost": round(cost, 2),
+        "partial": filled < qty,
+    }
+
+@app.get("/clearing/spot/{symbol}")
+async def clearing_spot(symbol: str, quantity: float):
+    url = f"https://api.binance.com/api/v3/depth?symbol={symbol.upper()}&limit=1000"
+    async with httpx.AsyncClient() as c: r = await c.get(url)
+    if r.status_code != 200:
+        raise HTTPException(502, "Failed to fetch orderbook")
+    data = r.json()
+    bids = [[float(p), float(q)] for p, q in data["bids"]]
+    asks = [[float(p), float(q)] for p, q in data["asks"]]
+    return {"symbol": symbol.upper(), "venue": "spot", "quantity": quantity,
+            "bid": _clearing(bids, quantity), "ask": _clearing(asks, quantity)}
+
+@app.get("/clearing/perp/{symbol}")
+async def clearing_perp(symbol: str, quantity: float):
+    url = f"https://fapi.binance.com/fapi/v1/depth?symbol={symbol.upper()}&limit=1000"
+    async with httpx.AsyncClient() as c: r = await c.get(url)
+    if r.status_code != 200:
+        raise HTTPException(502, "Failed to fetch perp orderbook")
+    data = r.json()
+    bids = [[float(p), float(q)] for p, q in data["bids"]]
+    asks = [[float(p), float(q)] for p, q in data["asks"]]
+    return {"symbol": symbol.upper(), "venue": "perp", "quantity": quantity,
+            "bid": _clearing(bids, quantity), "ask": _clearing(asks, quantity)}
