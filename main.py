@@ -20,11 +20,7 @@ from typing import Optional
 import httpx
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request, Response
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Update,
-)
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -74,7 +70,7 @@ class Ticket(SQLModel, table=True):
     client_chat_id: int
     client_msg_id: Optional[int] = None
     trader_msg_id: Optional[int] = None
-    status: str = "open"   # open | quoted | expired | cancelled
+    status: str = "open"   # open | quoted | traded
     price: Optional[float] = None
     valid_until: Optional[datetime] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -106,20 +102,53 @@ def log_event(ticket_id: int, event: str, payload: dict | None = None) -> None:
 
 # ───────────────────── TELEGRAM BOT ──────────────────────────────────────
 defaults = Defaults(parse_mode=ParseMode.HTML)
+ptb: Application = ApplicationBuilder().token(BOT_TOKEN).defaults(defaults).build()
 
-ptb: Application = (
-    ApplicationBuilder()
-    .token(BOT_TOKEN)
-    .defaults(defaults)
-    .build()
-)
+# ─────────── helpers ─────────────────────────────────────────────────────
+def fmt_waiting(t: Ticket) -> str:
+    return (
+        f"🆕  Ticket #{t.id}\n"
+        f"────────────────────\n"
+        f"SIDE    :  {t.side.upper()}\n"
+        f"QTY     :  {t.qty} {t.symbol}\n"
+        f"────────────────────\n"
+        f"STATUS  :  Waiting for price…\n\n"
+        f"🔄 Refresh to update."
+    )
 
-# helper – inline keyboard
-def make_refresh_markup(tid: int) -> InlineKeyboardMarkup:
+def fmt_quoted(t: Ticket, remain: int) -> str:
+    return (
+        f"🆕  Ticket #{t.id}\n"
+        f"────────────────────\n"
+        f"SIDE    :  {t.side.upper()}\n"
+        f"QTY     :  {t.qty} {t.symbol}\n"
+        f"────────────────────\n"
+        f"Price   :  {t.price} (valid {remain}s)\n\n"
+        f"Press ✅ Accept to trade.\n\n"
+        f"🔄 Refresh to update."
+    )
+
+def fmt_traded(t: Ticket) -> str:
+    return (
+        f"✅ TRADE DONE\n"
+        f"Ticket #{t.id} | {t.side.upper()} {t.qty} {t.symbol}\n"
+        f"Price   :  {t.price}"
+    )
+
+def kb_open(tid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup.from_button(
         InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh:{tid}")
     )
 
+def kb_quoted(tid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Accept",   callback_data=f"accept:{tid}"),
+            InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh:{tid}"),
+        ]
+    ])
+
+# ─────────── expiry task ────────────────────────────────────────────────
 async def expire_worker(ticket_id: int, delay: int) -> None:
     await asyncio.sleep(delay)
     with db() as s:
@@ -128,23 +157,31 @@ async def expire_worker(ticket_id: int, delay: int) -> None:
             return
         if t.valid_until and t.valid_until > datetime.utcnow():
             return
-        t.status = "expired"
+
+        # revert to waiting status
+        t.status = "open"
+        t.price = None
+        t.valid_until = None
         t.updated_at = datetime.utcnow()
         s.add(t)
         s.commit()
+
     # notify chats
-    if t.trader_msg_id:
-        await ptb.bot.edit_message_text(
-            chat_id=ADMIN_CHAT_ID,
-            message_id=t.trader_msg_id,
-            text=f"❌ RFQ #{ticket_id} expired.",
-        )
     if t.client_msg_id:
         await ptb.bot.edit_message_text(
             chat_id=t.client_chat_id,
             message_id=t.client_msg_id,
-            text=f"❌ Quote for ticket #{ticket_id} expired.",
+            text=fmt_waiting(t),
+            reply_markup=kb_open(ticket_id),
         )
+    # ping traders again
+    await ptb.bot.send_message(
+        chat_id=ADMIN_CHAT_ID,
+        text=(
+            f"⏳ RFQ #{ticket_id} expired without acceptance.\n"
+            f"Please re-price:\n<code>/quote {ticket_id} price secs</code>"
+        ),
+    )
     log_event(ticket_id, "expired", {})
 
 # ─────────── /rfq (client) ───────────────────────────────────────────────
@@ -176,16 +213,9 @@ async def cmd_rfq(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s.commit()
         s.refresh(t)
 
-    log_event(
-        t.id,
-        "rfq_created",
-        {"group": update.effective_chat.title or update.effective_chat.id},
-    )
-
     client_msg = await update.message.reply_text(
-        f"🆕 Ticket <b>#{t.id}</b> | {side.upper()} {qty} {symbol}\n"
-        f"⏳ Waiting for price…",
-        reply_markup=make_refresh_markup(t.id),
+        fmt_waiting(t),
+        reply_markup=kb_open(t.id),
     )
     trader_msg = await ptb.bot.send_message(
         chat_id=ADMIN_CHAT_ID,
@@ -203,6 +233,7 @@ async def cmd_rfq(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s.add(t)
         s.commit()
 
+    log_event(t.id, "rfq_created", {})
     asyncio.create_task(expire_worker(t.id, RFQ_TTL))
 
 # ─────────── /quote (trader) ─────────────────────────────────────────────
@@ -226,9 +257,10 @@ async def cmd_quote(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not t:
             await update.message.reply_text("Ticket not found.")
             return
-        if t.status != "open":
-            await update.message.reply_text(f"Ticket is already {t.status}.")
+        if t.status == "traded":
+            await update.message.reply_text("Ticket already traded.")
             return
+        # allow re-pricing if open
         t.price = price
         t.status = "quoted"
         t.valid_until = datetime.utcnow() + timedelta(seconds=secs)
@@ -236,34 +268,26 @@ async def cmd_quote(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s.add(t)
         s.commit()
 
-    log_event(
-        ticket_id,
-        "quoted",
-        {"trader": update.effective_user.username, "price": price, "secs": secs},
-    )
-
+    remain = secs
     await ptb.bot.edit_message_text(
         chat_id=ADMIN_CHAT_ID,
         message_id=t.trader_msg_id,
         text=(
-            f"✅ RFQ #{ticket_id} priced {price} (valid {secs}s) "
-            f"by @{update.effective_user.username}"
+            f"✅ RFQ #{ticket_id} priced {price} "
+            f"(valid {secs}s) by @{update.effective_user.username}"
         ),
     )
     await ptb.bot.edit_message_text(
         chat_id=t.client_chat_id,
         message_id=t.client_msg_id,
-        text=(
-            f"💰 Ticket <b>#{ticket_id}</b> | {t.side.upper()} {t.qty} {t.symbol}\n"
-            f"Price: <b>{price}</b> (valid {secs}s)\n"
-            f"🔄 Refresh to update."
-        ),
-        reply_markup=make_refresh_markup(ticket_id),
+        text=fmt_quoted(t, remain),
+        reply_markup=kb_quoted(ticket_id),
     )
 
+    log_event(ticket_id, "quoted", {"trader": update.effective_user.username, "price": price, "secs": secs})
     asyncio.create_task(expire_worker(ticket_id, secs))
 
-# ─────────── Refresh callback ────────────────────────────────────────────
+# ─────────── Refresh & Accept callbacks ──────────────────────────────────
 async def cb_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -273,28 +297,48 @@ async def cb_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         t: Ticket | None = s.get(Ticket, tid)
 
     if not t:
-        txt = "❌ Ticket not found."
-    elif t.status == "quoted" and t.valid_until > datetime.utcnow():
+        await query.edit_message_text("❌ Ticket not found.")
+        return
+
+    if t.status == "quoted" and t.valid_until > datetime.utcnow():
         remain = max(0, int((t.valid_until - datetime.utcnow()).total_seconds()))
-        txt = (
-            f"💰 Ticket <b>#{t.id}</b> | {t.side.upper()} {t.qty} {t.symbol}\n"
-            f"Price: <b>{t.price}</b> (valid {remain}s)\n"
-            f"🔄 Refresh to update."
-        )
-    elif t.status == "expired":
-        txt = f"❌ Quote for ticket #{t.id} expired."
-    else:  # still open
-        txt = (
-            f"🆕 Ticket <b>#{t.id}</b> | {t.side.upper()} {t.qty} {t.symbol}\n"
-            f"⏳ Waiting for price…"
-        )
+        await query.edit_message_text(fmt_quoted(t, remain), reply_markup=kb_quoted(t.id))
+    elif t.status == "traded":
+        await query.edit_message_text(fmt_traded(t))
+    else:  # open
+        await query.edit_message_text(fmt_waiting(t), reply_markup=kb_open(t.id))
 
-    await query.edit_message_text(txt, reply_markup=make_refresh_markup(tid))
+async def cb_accept(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    tid = int(query.data.split(":")[1])
 
-# register handlers
+    with db() as s:
+        t: Ticket | None = s.get(Ticket, tid)
+        if not t or t.status != "quoted":
+            await query.edit_message_text("❌ Quote no longer valid.")
+            return
+        if t.valid_until < datetime.utcnow():
+            await query.edit_message_text("❌ Quote expired.")
+            return
+        t.status = "traded"
+        t.updated_at = datetime.utcnow()
+        s.add(t)
+        s.commit()
+
+    # notify both chats
+    await query.edit_message_text(fmt_traded(t))
+    await ptb.bot.send_message(
+        chat_id=ADMIN_CHAT_ID,
+        text=fmt_traded(t),
+    )
+    log_event(tid, "traded", {"user": query.from_user.username})
+
+# ─────────── register handlers ───────────────────────────────────────────
 ptb.add_handler(CommandHandler("rfq",   cmd_rfq))
 ptb.add_handler(CommandHandler("quote", cmd_quote))
 ptb.add_handler(CallbackQueryHandler(cb_refresh, pattern=r"^refresh:\d+$"))
+ptb.add_handler(CallbackQueryHandler(cb_accept,  pattern=r"^accept:\d+$"))
 
 # ───────────────────── FASTAPI / WEBHOOK ─────────────────────────────────
 app = FastAPI()
@@ -303,8 +347,7 @@ app = FastAPI()
 async def _startup() -> None:
     init_db()
     url = f"{PUBLIC_BASE_URL}/telegram"
-    await ptb.bot.set_webhook(url, secret_token=WEBHOOK_SECRET,
-                              drop_pending_updates=True)
+    await ptb.bot.set_webhook(url, secret_token=WEBHOOK_SECRET, drop_pending_updates=True)
     logging.info("Webhook set to %s", url)
     await ptb.initialize()
     asyncio.create_task(ptb.start())
@@ -321,7 +364,7 @@ async def telegram_webhook(req: Request):
     await ptb.process_update(update)
     return Response(status_code=HTTPStatus.OK)
 
-# ───────────────────── Health & Binance helpers ─────────────────────────
+# ───────────────────── Health & Binance helpers (unchanged) ─────────────
 @app.get("/")
 def health(): return {"status": "alive"}
 
