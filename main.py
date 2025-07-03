@@ -171,12 +171,19 @@ def fmt_traded(t: Ticket) -> str:
 
 # ─────────── Helpers for market data ─────────────────────────────────────
 async def _binance_mid(symbol: str) -> float:
-    url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol.upper()}USDT"
+    """
+    True mid-price = (best bid + best ask) / 2, taken from the top of the book.
+    """
+    url = f"https://fapi.binance.com/fapi/v1/depth?symbol={symbol.upper()}USDT&limit=5"
     async with httpx.AsyncClient() as c:
         r = await c.get(url, timeout=5)
     if r.status_code != 200:
-        raise RuntimeError("Binance price unavailable")
-    return float(r.json()["price"])
+        raise RuntimeError("Binance depth unavailable")
+    data = r.json()
+    best_bid = float(data["bids"][0][0])
+    best_ask = float(data["asks"][0][0])
+    return (best_bid + best_ask) / 2
+
 
 async def _clearing_avg(symbol: str, side: str, qty: float) -> float:
     url = f"https://fapi.binance.com/fapi/v1/depth?symbol={symbol.upper()}USDT&limit=1000"
