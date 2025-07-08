@@ -516,3 +516,76 @@ async def clearing_perp(symbol: str, quantity: float):
         "bid": _clearing(bids, quantity),
         "ask": _clearing(asks, quantity),
     }
+
+@app.get("/liquidity/spot/{symbol}")
+async def liquidity_info_spot(symbol: str, quantity: float):
+    url = f"https://api.binance.com/api/v3/depth?symbol={symbol.upper()}USDT&limit=1000"
+    async with httpx.AsyncClient() as c:
+        r = await c.get(url)
+    if r.status_code != 200:
+        raise HTTPException(502, "Failed to fetch orderbook")
+    data = r.json()
+
+    bids = [[float(p), float(q)] for p, q in data["bids"]]
+    asks = [[float(p), float(q)] for p, q in data["asks"]]
+    
+    if not bids or not asks:
+        raise HTTPException(400, "Orderbook too thin")
+
+    best_bid = bids[0][0]
+    best_ask = asks[0][0]
+    mid = round((best_bid + best_ask) / 2, 6)
+
+    # Depth price (worst level needed to fill quantity)
+    def get_depth_price(book: list[list[float]]) -> float:
+        filled = 0.0
+        for price, size in book:
+            filled += size
+            if filled >= quantity:
+                return price
+        raise HTTPException(400, "Orderbook too thin")
+
+    # Clearing VWAP
+    def _clearing(book: list[list[float]], qty: float):
+        filled, cost = 0.0, 0.0
+        for price, size in book:
+            take = min(qty - filled, size)
+            cost += take * price
+            filled += take
+            if filled >= qty:
+                break
+        if filled == 0:
+            raise HTTPException(400, "Orderbook too thin")
+        avg = cost / filled
+        return round(avg, 6)
+
+    try:
+        bid_depth_price = get_depth_price(bids)
+        ask_depth_price = get_depth_price(asks)
+        bid_clearing = _clearing(bids, quantity)
+        ask_clearing = _clearing(asks, quantity)
+    except HTTPException as e:
+        raise e
+
+    def bps(p): return round((p - mid) / mid * 10000, 1)
+
+    return {
+        "symbol": symbol.upper(),
+        "venue": "spot",
+        "quantity": quantity,
+        "mid": mid,
+        "bid": {
+            "depth_price": round(bid_depth_price, 6),
+            "spread": round(bid_depth_price - mid, 6),
+            "bps": bps(bid_depth_price),
+            "clearing_price": bid_clearing,
+            "clearing_bps": bps(bid_clearing),
+        },
+        "ask": {
+            "depth_price": round(ask_depth_price, 6),
+            "spread": round(ask_depth_price - mid, 6),
+            "bps": bps(ask_depth_price),
+            "clearing_price": ask_clearing,
+            "clearing_bps": bps(ask_clearing),
+        }
+    }
