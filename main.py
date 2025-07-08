@@ -519,40 +519,16 @@ async def clearing_perp(symbol: str, quantity: float):
 
 @app.get("/liquidity/spot/{symbol}")
 async def liquidity_info_spot(symbol: str, quantity: float):
-    symbol_pair = symbol.upper() + "USDT"
+    url = f"https://api.binance.com/api/v3/depth?symbol={symbol.upper()}USDT&limit=1000"
+    async with httpx.AsyncClient() as c:
+        r = await c.get(url)
+    if r.status_code != 200:
+        raise HTTPException(502, "Failed to fetch orderbook")
+    data = r.json()
 
-    async def fetch_orderbook():
-        # First try Binance
-        try:
-            url = f"https://api.binance.com/api/v3/depth?symbol={symbol_pair}&limit=1000"
-            async with httpx.AsyncClient() as c:
-                r = await c.get(url)
-            if r.status_code == 200:
-                data = r.json()
-                return (
-                    [[float(p), float(q)] for p, q in data["bids"]],
-                    [[float(p), float(q)] for p, q in data["asks"]],
-                    "binance"
-                )
-        except Exception:
-            pass  # fallback
-
-        # Then fallback to Bybit
-        url = f"https://api.bybit.com/v5/market/orderbook?category=spot&symbol={symbol_pair}"
-        async with httpx.AsyncClient() as c:
-            r = await c.get(url)
-        if r.status_code != 200:
-            raise HTTPException(502, "Both Binance and Bybit orderbooks failed")
-        data = r.json()
-        result = data.get("result", {})
-        return (
-            [[float(p), float(q)] for p, q in result.get("b", [])],
-            [[float(p), float(q)] for p, q in result.get("a", [])],
-            "bybit"
-        )
-
-    bids, asks, source = await fetch_orderbook()
-
+    bids = [[float(p), float(q)] for p, q in data["bids"]]
+    asks = [[float(p), float(q)] for p, q in data["asks"]]
+    
     if not bids or not asks:
         raise HTTPException(400, "Orderbook too thin")
 
@@ -581,8 +557,6 @@ async def liquidity_info_spot(symbol: str, quantity: float):
         avg = cost / filled
         return avg
 
-    def bps(p): return (p - mid) / mid * 10000
-
     try:
         bid_depth_price = get_depth_price(bids)
         ask_depth_price = get_depth_price(asks)
@@ -591,9 +565,81 @@ async def liquidity_info_spot(symbol: str, quantity: float):
     except HTTPException as e:
         raise e
 
+    def bps(p): return (p - mid) / mid * 10000
+
     return {
         "symbol": symbol.upper(),
-        "venue": source,
+        "venue": "spot",
+        "quantity": quantity,
+        "mid": mid,
+        "bid": {
+            "depth_price": bid_depth_price,
+            "spread": bid_depth_price - mid,
+            "bps": bps(bid_depth_price),
+            "clearing_price": bid_clearing,
+            "clearing_bps": bps(bid_clearing),
+        },
+        "ask": {
+            "depth_price": ask_depth_price,
+            "spread": ask_depth_price - mid,
+            "bps": bps(ask_depth_price),
+            "clearing_price": ask_clearing,
+            "clearing_bps": bps(ask_clearing),
+        }
+    }
+
+@app.get("/liquidity/spot/bybit/{symbol}")
+async def liquidity_info_bybit_spot(symbol: str, quantity: float):
+    symbol_pair = symbol.upper() + "USDT"
+    url = f"https://api.bybit.com/v5/market/orderbook?category=spot&symbol={symbol_pair}"
+
+    async with httpx.AsyncClient() as c:
+        r = await c.get(url)
+    if r.status_code != 200:
+        raise HTTPException(502, "Bybit orderbook unavailable")
+
+    data = r.json()
+    result = data.get("result", {})
+    bids = [[float(p), float(q)] for p, q in result.get("b", [])]
+    asks = [[float(p), float(q)] for p, q in result.get("a", [])]
+
+    if not bids or not asks:
+        raise HTTPException(400, "Orderbook too thin")
+
+    best_bid = bids[0][0]
+    best_ask = asks[0][0]
+    mid = (best_bid + best_ask) / 2
+
+    def get_depth_price(book: list[list[float]]) -> float:
+        filled = 0.0
+        for price, size in book:
+            filled += size
+            if filled >= quantity:
+                return price
+        raise HTTPException(400, "Orderbook too thin")
+
+    def _clearing(book: list[list[float]], qty: float):
+        filled, cost = 0.0, 0.0
+        for price, size in book:
+            take = min(qty - filled, size)
+            cost += take * price
+            filled += take
+            if filled >= qty:
+                break
+        if filled == 0:
+            raise HTTPException(400, "Orderbook too thin")
+        return cost / filled
+
+    def bps(p): return (p - mid) / mid * 10000
+
+    bid_depth_price = get_depth_price(bids)
+    ask_depth_price = get_depth_price(asks)
+    bid_clearing = _clearing(bids, quantity)
+    ask_clearing = _clearing(asks, quantity)
+
+    return {
+        "symbol": symbol.upper(),
+        "venue": "bybit",
         "quantity": quantity,
         "mid": mid,
         "bid": {
