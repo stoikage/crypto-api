@@ -690,8 +690,8 @@ async def liquidity_info_okx_spot(symbol: str, quantity: float):
     
     data = r.json()
     book_data = data.get("data", [{}])[0]
-    bids = [[float(p), float(q)] for p, q, *_ in book_data.get("bids", [])]
-    asks = [[float(p), float(q)] for p, q, *_ in book_data.get("asks", [])]
+    bids = [[float(level[0]), float(level[1])] for level in book_data.get("bids", [])]
+    asks = [[float(level[0]), float(level[1])] for level in book_data.get("asks", [])]
 
     if not bids or not asks:
         raise HTTPException(400, "Orderbook too thin")
@@ -756,14 +756,15 @@ async def price_okx(symbol: str):
     async with httpx.AsyncClient() as c:
         r = await c.get(url)
     if r.status_code != 200:
-            raise HTTPException(502, "OKX price unavailable")
-    
+        raise HTTPException(502, "OKX price unavailable")
+
     data = r.json()
-    ticker = data.get("data", [{}])[0]
-    if "last" not in ticker:
-        raise HTTPException(400, "Invalid symbol or no data")
+    results = data.get("data", [])
+    if not results or "last" not in results[0]:
+        raise HTTPException(400, "Invalid symbol or no price found")
 
     return {
-        "symbol": ticker["instId"],
-        "price": float(ticker["last"]),
+        "symbol": results[0]["instId"],
+        "price": float(results[0]["last"]),
     }
+
