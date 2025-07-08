@@ -683,12 +683,17 @@ async def liquidity_info_okx_spot(symbol: str, quantity: float):
     inst_id = f"{symbol.upper()}-USDT"
     url = f"https://www.okx.com/api/v5/market/books?instId={inst_id}&sz=400"
 
+    headers = {
+        "User-Agent": "okx-liquidity-fetcher/1.0"
+    }
+
     async with httpx.AsyncClient() as c:
-        r = await c.get(url)
-    if r.status_code != 200:
-        raise HTTPException(502, "OKX orderbook unavailable")
-    
+        r = await c.get(url, headers=headers)
+
     data = r.json()
+    if r.status_code != 200 or data.get("code") != "0":
+        raise HTTPException(502, "OKX orderbook unavailable")
+
     book_data = data.get("data", [{}])[0]
     bids = [[float(level[0]), float(level[1])] for level in book_data.get("bids", [])]
     asks = [[float(level[0]), float(level[1])] for level in book_data.get("asks", [])]
@@ -748,23 +753,30 @@ async def liquidity_info_okx_spot(symbol: str, quantity: float):
         }
     }
 
+
 @app.get("/price/okx/{symbol}")
 async def price_okx(symbol: str):
     inst_id = f"{symbol.upper()}-USDT"
     url = f"https://www.okx.com/api/v5/market/ticker?instId={inst_id}"
 
+    headers = {
+        "User-Agent": "okx-liquidity-fetcher/1.0"
+    }
+
     async with httpx.AsyncClient() as c:
-        r = await c.get(url)
-    if r.status_code != 200:
-        raise HTTPException(502, "OKX price unavailable")
+        r = await c.get(url, headers=headers)
 
     data = r.json()
-    results = data.get("data", [])
-    if not results or "last" not in results[0]:
+    if r.status_code != 200 or data.get("code") != "0":
+        raise HTTPException(502, "OKX price unavailable")
+
+    result = data.get("data", [{}])[0]
+    if "last" not in result:
         raise HTTPException(400, "Invalid symbol or no price found")
 
     return {
-        "symbol": results[0]["instId"],
-        "price": float(results[0]["last"]),
+        "symbol": result["instId"],
+        "price": float(result["last"]),
     }
+
 
