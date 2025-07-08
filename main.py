@@ -591,7 +591,7 @@ async def liquidity_info_spot(symbol: str, quantity: float):
 @app.get("/liquidity/spot/bybit/{symbol}")
 async def liquidity_info_bybit_spot(symbol: str, quantity: float):
     symbol_pair = symbol.upper() + "USDT"
-    url = f"https://api.bybit.com/v5/market/orderbook?category=spot&symbol={symbol_pair}"
+    url = f"https://api.bybit.com/v5/market/orderbook?category=spot&symbol={symbol_pair}&limit=200"
 
     async with httpx.AsyncClient() as c:
         r = await c.get(url)
@@ -678,3 +678,92 @@ async def price_bybit(symbol: str):
         "price": float(result[0]["lastPrice"]),
     }
 
+@app.get("/liquidity/spot/okx/{symbol}")
+async def liquidity_info_okx_spot(symbol: str, quantity: float):
+    inst_id = f"{symbol.upper()}-USDT"
+    url = f"https://www.okx.com/api/v5/market/books?instId={inst_id}&sz=400"
+
+    async with httpx.AsyncClient() as c:
+        r = await c.get(url)
+    if r.status_code != 200:
+        raise HTTPException(502, "OKX orderbook unavailable")
+    
+    data = r.json()
+    book_data = data.get("data", [{}])[0]
+    bids = [[float(p), float(q)] for p, q, *_ in book_data.get("bids", [])]
+    asks = [[float(p), float(q)] for p, q, *_ in book_data.get("asks", [])]
+
+    if not bids or not asks:
+        raise HTTPException(400, "Orderbook too thin")
+
+    best_bid = bids[0][0]
+    best_ask = asks[0][0]
+    mid = (best_bid + best_ask) / 2
+
+    def get_depth_price(book: list[list[float]]) -> float:
+        filled = 0.0
+        for price, size in book:
+            filled += size
+            if filled >= quantity:
+                return price
+        raise HTTPException(400, "Orderbook too thin")
+
+    def _clearing(book: list[list[float]], qty: float):
+        filled, cost = 0.0, 0.0
+        for price, size in book:
+            take = min(qty - filled, size)
+            cost += take * price
+            filled += take
+            if filled >= qty:
+                break
+        if filled == 0:
+            raise HTTPException(400, "Orderbook too thin")
+        return cost / filled
+
+    def bps(p): return (p - mid) / mid * 10000
+
+    bid_depth_price = get_depth_price(bids)
+    ask_depth_price = get_depth_price(asks)
+    bid_clearing = _clearing(bids, quantity)
+    ask_clearing = _clearing(asks, quantity)
+
+    return {
+        "symbol": symbol.upper(),
+        "venue": "okx",
+        "quantity": quantity,
+        "mid": mid,
+        "bid": {
+            "depth_price": bid_depth_price,
+            "spread": bid_depth_price - mid,
+            "bps": bps(bid_depth_price),
+            "clearing_price": bid_clearing,
+            "clearing_bps": bps(bid_clearing),
+        },
+        "ask": {
+            "depth_price": ask_depth_price,
+            "spread": ask_depth_price - mid,
+            "bps": bps(ask_depth_price),
+            "clearing_price": ask_clearing,
+            "clearing_bps": bps(ask_clearing),
+        }
+    }
+
+@app.get("/price/okx/{symbol}")
+async def price_okx(symbol: str):
+    inst_id = f"{symbol.upper()}-USDT"
+    url = f"https://www.okx.com/api/v5/market/ticker?instId={inst_id}"
+
+    async with httpx.AsyncClient() as c:
+        r = await c.get(url)
+    if r.status_code != 200:
+            raise HTTPException(502, "OKX price unavailable")
+    
+    data = r.json()
+    ticker = data.get("data", [{}])[0]
+    if "last" not in ticker:
+        raise HTTPException(400, "Invalid symbol or no data")
+
+    return {
+        "symbol": ticker["instId"],
+        "price": float(ticker["last"]),
+    }
