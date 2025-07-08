@@ -534,9 +534,8 @@ async def liquidity_info_spot(symbol: str, quantity: float):
 
     best_bid = bids[0][0]
     best_ask = asks[0][0]
-    mid = round((best_bid + best_ask) / 2, 6)
+    mid = (best_bid + best_ask) / 2
 
-    # Depth price (worst level needed to fill quantity)
     def get_depth_price(book: list[list[float]]) -> float:
         filled = 0.0
         for price, size in book:
@@ -545,7 +544,6 @@ async def liquidity_info_spot(symbol: str, quantity: float):
                 return price
         raise HTTPException(400, "Orderbook too thin")
 
-    # Clearing VWAP
     def _clearing(book: list[list[float]], qty: float):
         filled, cost = 0.0, 0.0
         for price, size in book:
@@ -557,7 +555,7 @@ async def liquidity_info_spot(symbol: str, quantity: float):
         if filled == 0:
             raise HTTPException(400, "Orderbook too thin")
         avg = cost / filled
-        return round(avg, 6)
+        return avg
 
     try:
         bid_depth_price = get_depth_price(bids)
@@ -567,7 +565,7 @@ async def liquidity_info_spot(symbol: str, quantity: float):
     except HTTPException as e:
         raise e
 
-    def bps(p): return round((p - mid) / mid * 10000, 1)
+    def bps(p): return (p - mid) / mid * 10000
 
     return {
         "symbol": symbol.upper(),
@@ -575,15 +573,15 @@ async def liquidity_info_spot(symbol: str, quantity: float):
         "quantity": quantity,
         "mid": mid,
         "bid": {
-            "depth_price": round(bid_depth_price, 6),
-            "spread": round(bid_depth_price - mid, 6),
+            "depth_price": bid_depth_price,
+            "spread": bid_depth_price - mid,
             "bps": bps(bid_depth_price),
             "clearing_price": bid_clearing,
             "clearing_bps": bps(bid_clearing),
         },
         "ask": {
-            "depth_price": round(ask_depth_price, 6),
-            "spread": round(ask_depth_price - mid, 6),
+            "depth_price": ask_depth_price,
+            "spread": ask_depth_price - mid,
             "bps": bps(ask_depth_price),
             "clearing_price": ask_clearing,
             "clearing_bps": bps(ask_clearing),
