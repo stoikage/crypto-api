@@ -657,3 +657,24 @@ async def liquidity_info_bybit_spot(symbol: str, quantity: float):
             "clearing_bps": bps(ask_clearing),
         }
     }
+
+@app.get("/price/bybit/{symbol}")
+async def price_bybit(symbol: str):
+    symbol_pair = symbol.upper() + "USDT"
+    url = f"https://api.bybit.com/v5/market/tickers?category=spot&symbol={symbol_pair}"
+
+    async with httpx.AsyncClient() as c:
+        r = await c.get(url)
+    if r.status_code != 200:
+        raise HTTPException(502, "Bybit price unavailable")
+
+    data = r.json()
+    result = data.get("result", {}).get("list", [])
+    if not result or "lastPrice" not in result[0]:
+        raise HTTPException(400, "Invalid symbol or no data")
+
+    return {
+        "symbol": result[0]["symbol"],
+        "price": float(result[0]["lastPrice"]),
+    }
+
