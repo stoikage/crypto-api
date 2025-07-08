@@ -519,16 +519,40 @@ async def clearing_perp(symbol: str, quantity: float):
 
 @app.get("/liquidity/spot/{symbol}")
 async def liquidity_info_spot(symbol: str, quantity: float):
-    url = f"https://api.binance.com/api/v3/depth?symbol={symbol.upper()}USDT&limit=1000"
-    async with httpx.AsyncClient() as c:
-        r = await c.get(url)
-    if r.status_code != 200:
-        raise HTTPException(502, "Failed to fetch orderbook")
-    data = r.json()
+    symbol_pair = symbol.upper() + "USDT"
 
-    bids = [[float(p), float(q)] for p, q in data["bids"]]
-    asks = [[float(p), float(q)] for p, q in data["asks"]]
-    
+    async def fetch_orderbook():
+        # First try Binance
+        try:
+            url = f"https://api.binance.com/api/v3/depth?symbol={symbol_pair}&limit=1000"
+            async with httpx.AsyncClient() as c:
+                r = await c.get(url)
+            if r.status_code == 200:
+                data = r.json()
+                return (
+                    [[float(p), float(q)] for p, q in data["bids"]],
+                    [[float(p), float(q)] for p, q in data["asks"]],
+                    "binance"
+                )
+        except Exception:
+            pass  # fallback
+
+        # Then fallback to Bybit
+        url = f"https://api.bybit.com/v5/market/orderbook?category=spot&symbol={symbol_pair}"
+        async with httpx.AsyncClient() as c:
+            r = await c.get(url)
+        if r.status_code != 200:
+            raise HTTPException(502, "Both Binance and Bybit orderbooks failed")
+        data = r.json()
+        result = data.get("result", {})
+        return (
+            [[float(p), float(q)] for p, q in result.get("b", [])],
+            [[float(p), float(q)] for p, q in result.get("a", [])],
+            "bybit"
+        )
+
+    bids, asks, source = await fetch_orderbook()
+
     if not bids or not asks:
         raise HTTPException(400, "Orderbook too thin")
 
@@ -557,6 +581,8 @@ async def liquidity_info_spot(symbol: str, quantity: float):
         avg = cost / filled
         return avg
 
+    def bps(p): return (p - mid) / mid * 10000
+
     try:
         bid_depth_price = get_depth_price(bids)
         ask_depth_price = get_depth_price(asks)
@@ -565,11 +591,9 @@ async def liquidity_info_spot(symbol: str, quantity: float):
     except HTTPException as e:
         raise e
 
-    def bps(p): return (p - mid) / mid * 10000
-
     return {
         "symbol": symbol.upper(),
-        "venue": "spot",
+        "venue": source,
         "quantity": quantity,
         "mid": mid,
         "bid": {
