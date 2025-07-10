@@ -780,3 +780,26 @@ async def price_okx(symbol: str):
     }
 
 
+@app.get("/price/equity/{symbol}")
+async def price_equity(symbol: str):
+    POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
+    if not POLYGON_API_KEY:
+        raise HTTPException(status_code=500, detail="Polygon API key missing.")
+
+    url = f"https://api.polygon.io/v2/last/trade/stocks/{symbol.upper()}?apiKey={POLYGON_API_KEY}"
+    async with httpx.AsyncClient() as c:
+        r = await c.get(url)
+
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail="Polygon API request failed.")
+
+    data = r.json()
+    try:
+        result = data["results"]
+        return {
+            "symbol": symbol.upper(),
+            "price": result["p"],
+            "timestamp": result["t"]
+        }
+    except KeyError:
+        raise HTTPException(status_code=400, detail=f"Invalid response from Polygon for symbol '{symbol}'.")
